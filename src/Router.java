@@ -1,107 +1,134 @@
 package src;
 
-import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.UUID;
 
 public class Router {
-    private ConfigLoader.AppConfig config;
-    private Map<String, HttpHandler> handlers = new HashMap<>();
+    private final ConfigLoader.AppConfig config;
+    private final ErrorResponses errors;
+    private final Map<String, HttpHandler> handlers = new HashMap<>();
+    private final Map<String, Long> sessions = new HashMap<>();
 
     public Router(ConfigLoader.AppConfig config) {
         this.config = config;
+        this.errors = new ErrorResponses(config);
         handlers.put("ApiHandler", new ApiHandler());
-        handlers.put("FileHandler", new FileHandler());
+        handlers.put("FileHandler", new FileHandler(errors));
         handlers.put("CgiHandler", new CgiHandler());
     }
 
-    public HandlerResult handle(HttpRequest request) {
+    public HttpResponse handle(HttpRequest request) {
+        ConfigLoader.VHostConfig vhost = findVHost(request.getHeaders().get("host"));
+        if (vhost == null) {
+            return errorResponse(404);
+        }
+
+        ConfigLoader.RouteConfig route = findRoute(vhost, request.getPath());
+        if (route == null) {
+            return errorResponse(404, vhost);
+        }
+
+        if (!route.methods.isEmpty() && !route.methods.contains(request.getMethod())) {
+            HttpResponse response = errorResponse(405, vhost);
+            response.addHeader("Allow", String.join(", ", route.methods));
+            return response;
+        }
+
+        if (route.redirectTo != null) {
+            HttpResponse response = new HttpResponse();
+            response.setStatus(301);
+            response.addHeader("Location", route.redirectTo);
+            response.setBody("Moved Permanently");
+            return response;
+        }
+
+        HttpHandler handler = handlers.get(route.handler);
+        if (handler == null) {
+            return errorResponse(500, vhost);
+        }
+
         try {
-            // Handle Session
-            String sessionId = null;
-            String cookieHeader = request.getHeaders().get("cookie");
-            if (cookieHeader != null) {
-                for (String part : cookieHeader.split(";")) {
-                    part = part.trim();
-                    if (part.startsWith("JSESSIONID=")) {
-                        sessionId = part.substring("JSESSIONID=".length());
-                        break;
-                    }
-                }
+            Session session = session(request);
+            HttpResponse response = handler.handle(request, vhost, route);
+            if (session.isNew) {
+                response.addHeader("Set-Cookie", "JSESSIONID=" + session.id + "; Path=/; HttpOnly; SameSite=Strict");
             }
-
-            Session session;
-            boolean newSession = false;
-            if (sessionId == null || (session = SessionManager.getSession(sessionId)) == null) {
-                session = SessionManager.createSession();
-                newSession = true;
-            }
-
-            // Find best vhost
-            String hostHeader = request.getHeaders().get("host");
-            if (hostHeader != null && hostHeader.contains(":")) {
-                hostHeader = hostHeader.split(":")[0];
-            }
-            
-            ConfigLoader.VHostConfig vhost = findVHost(hostHeader);
-            if (vhost == null) {
-                return new HandlerResult(errorResponse(404));
-            }
-            
-            // Find best route
-            ConfigLoader.RouteConfig route = findRoute(vhost, request.getPath());
-            if (route == null) {
-                return new HandlerResult(errorResponse(404));
-            }
-
-            // Invoke Handler
-            HttpHandler handler = handlers.get(route.handler);
-            if (handler == null) {
-                return new HandlerResult(errorResponse(500)); // Unknown handler
-            }
-
-            HandlerResult result = handler.handle(request, vhost, route);
-
-            if (result.response != null && newSession) {
-                result.response.addHeader("Set-Cookie", "JSESSIONID=" + session.getId() + "; Path=/; HttpOnly; SameSite=Strict");
-            }
-
-            return result;
+            return response;
         } catch (Exception e) {
             e.printStackTrace();
-            return new HandlerResult(errorResponse(500));
+            return errorResponse(500, vhost);
         }
+    }
+
+    public HttpResponse errorResponse(int status) {
+        return errors.build(status);
+    }
+
+    private HttpResponse errorResponse(int status, ConfigLoader.VHostConfig vhost) {
+        return errors.build(status, vhost);
     }
 
     private ConfigLoader.VHostConfig findVHost(String host) {
-        if (config.vhosts.isEmpty()) return null;
-        if (host == null) return config.vhosts.get(0); // Default fallback
+        if (config.vhosts.isEmpty()) {
+            return null;
+        }
+        if (host == null) {
+            return config.vhosts.get(0);
+        }
 
+        String hostName = host.split(":", 2)[0];
         for (ConfigLoader.VHostConfig vhost : config.vhosts) {
-            if (host.equalsIgnoreCase(vhost.domain)) {
+            if (hostName.equalsIgnoreCase(vhost.domain)) {
                 return vhost;
             }
         }
-        return config.vhosts.get(0); // Fallback to first vhost
+        return config.vhosts.get(0);
     }
 
     private ConfigLoader.RouteConfig findRoute(ConfigLoader.VHostConfig vhost, String path) {
-        ConfigLoader.RouteConfig bestMatch = null;
-        for (ConfigLoader.RouteConfig rc : vhost.routes) {
-            if (path.startsWith(rc.path)) {
-                if (bestMatch == null || rc.path.length() > bestMatch.path.length()) {
-                    bestMatch = rc;
-                }
+        ConfigLoader.RouteConfig best = null;
+        for (ConfigLoader.RouteConfig route : vhost.routes) {
+            if (path.startsWith(route.path) && (best == null || route.path.length() > best.path.length())) {
+                best = route;
             }
         }
-        return bestMatch;
+        return best;
     }
 
-    public HttpResponse errorResponse(int code) {
-        HttpResponse res = new HttpResponse();
-        res.setStatus(code);
-        res.setBody(("Error " + code).getBytes());
-        res.addHeader("Content-Type", "text/plain");
-        return res;
+    private Session session(HttpRequest request) {
+        long now = System.currentTimeMillis();
+        sessions.entrySet().removeIf(entry -> now - entry.getValue() > config.server.sessionTimeoutSec * 1000);
+
+        String id = sessionId(request.getHeaders().get("cookie"));
+        if (id != null && sessions.containsKey(id)) {
+            sessions.put(id, now);
+            return new Session(id, false);
+        }
+
+        id = UUID.randomUUID().toString();
+        sessions.put(id, now);
+        return new Session(id, true);
+    }
+
+    private String sessionId(String cookieHeader) {
+        if (cookieHeader == null) return null;
+        for (String cookie : cookieHeader.split(";")) {
+            cookie = cookie.trim();
+            if (cookie.startsWith("JSESSIONID=")) {
+                return cookie.substring("JSESSIONID=".length());
+            }
+        }
+        return null;
+    }
+
+    private static class Session {
+        private final String id;
+        private final boolean isNew;
+
+        private Session(String id, boolean isNew) {
+            this.id = id;
+            this.isNew = isNew;
+        }
     }
 }

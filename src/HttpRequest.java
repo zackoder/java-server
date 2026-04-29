@@ -12,7 +12,7 @@ public class HttpRequest {
     private Map<String, String> queryParams = new HashMap<>();
 
     public String getMethod() { return method; }
-    public void setMethod(String method) { this.method = method; }
+    public void setMethod(String method) { this.method = method == null ? null : method.toUpperCase(); }
 
     public String getPath() { return path; }
     public void setPath(String path) {

@@ -1,214 +1,260 @@
 package src;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.nio.channels.*;
 import java.nio.ByteBuffer;
-import java.nio.file.Files;
+import java.nio.channels.SelectionKey;
+import java.nio.channels.Selector;
+import java.nio.channels.ServerSocketChannel;
+import java.nio.channels.SocketChannel;
+import java.util.HashSet;
 import java.util.Iterator;
-import java.util.List;
 import java.util.Set;
 
 public class Server {
-    private ConfigLoader.AppConfig config;
-    private Selector selector;
-    private Router router;
+    private final ConfigLoader.AppConfig config;
+    private final Router router;
+    private final Selector selector;
 
     public Server(ConfigLoader.AppConfig config) throws IOException {
         this.config = config;
-        this.selector = Selector.open();
         this.router = new Router(config);
-        BufferPool.init(config.server.bufferSize);
-        setupServers();
+        this.selector = Selector.open();
+        openPorts();
     }
 
-    private void setupServers() throws IOException {
-        for (int port : config.server.ports) {
-            ServerSocketChannel serverChannel = ServerSocketChannel.open();
-            serverChannel.configureBlocking(false);
-            serverChannel.bind(new InetSocketAddress("0.0.0.0", port));
-            serverChannel.register(selector, SelectionKey.OP_ACCEPT);
+    public void start() throws IOException {
+        while (true) {
+            selector.select(100);
+            closeTimedOutClients();
+
+            Iterator<SelectionKey> keys = selector.selectedKeys().iterator();
+            while (keys.hasNext()) {
+                SelectionKey key = keys.next();
+                keys.remove();
+                if (!key.isValid()) continue;
+
+                try {
+                    if (key.isAcceptable()) accept(key);
+                    if (key.isReadable()) read(key);
+                    if (key.isWritable()) write(key);
+                } catch (Exception e) {
+                    close(key);
+                }
+            }
+        }
+    }
+
+    private void openPorts() throws IOException {
+        Set<Integer> ports = new HashSet<>(config.server.ports);
+        if (ports.isEmpty()) throw new IOException("No ports configured");
+
+        for (int port : ports) {
+            ServerSocketChannel server = ServerSocketChannel.open();
+            server.configureBlocking(false);
+            server.bind(new InetSocketAddress("0.0.0.0", port));
+            server.register(selector, SelectionKey.OP_ACCEPT);
             System.out.println("Server listening on port " + port);
         }
     }
 
-    public void start() {
-        while (true) {
-            try {
-                if (selector.select(100) == 0) {
-                    checkProcesses();
-                    continue;
-                }
+    private void accept(SelectionKey key) throws IOException {
+        ServerSocketChannel server = (ServerSocketChannel) key.channel();
+        SocketChannel client = server.accept();
+        if (client == null) return;
 
-                checkProcesses();
-
-                Set<SelectionKey> selectedKeys = selector.selectedKeys();
-                Iterator<SelectionKey> iter = selectedKeys.iterator();
-
-                while (iter.hasNext()) {
-                    SelectionKey key = iter.next();
-                    iter.remove();
-
-                    if (!key.isValid()) continue;
-
-                    if (key.isAcceptable()) {
-                        handleAccept(key);
-                    } else if (key.isReadable()) {
-                        handleRead(key);
-                    } else if (key.isWritable()) {
-                        handleWrite(key);
-                    }
-                }
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
-        }
+        client.configureBlocking(false);
+        client.register(selector, SelectionKey.OP_READ, new Client());
     }
 
-    private void checkProcesses() {
-        long now = System.currentTimeMillis();
-        for (SelectionKey key : selector.keys()) {
-            if (key.attachment() instanceof ConnectionContext) {
-                ConnectionContext context = (ConnectionContext) key.attachment();
-                
-                // Connection Timeout
-                if (now - context.getLastActivityTime() > config.server.keepAliveTimeoutMs) {
-                    context.close();
-                    key.cancel();
-                    continue;
-                }
+    private void read(SelectionKey key) throws IOException {
+        SocketChannel channel = (SocketChannel) key.channel();
+        Client client = (Client) key.attachment();
+        client.lastActivity = System.currentTimeMillis();
 
-                if (context.getState() == ConnectionContext.State.PROCESSING) {
-                    Process p = context.getCgiProcess();
-                    if (p != null && !p.isAlive()) {
-                        handleCgiFinished(key, context);
-                    }
-                }
-            }
-        }
-    }
-
-    private void handleCgiFinished(SelectionKey key, ConnectionContext context) {
-        try {
-            byte[] output = Files.readAllBytes(context.getCgiOutputPath());
-            HttpResponse response = new HttpResponse();
-            
-            // Basic CGI header parsing
-            String content = new String(output);
-            int headerEnd = content.indexOf("\r\n\r\n");
-            if (headerEnd == -1) headerEnd = content.indexOf("\n\n");
-            
-            if (headerEnd != -1) {
-                String headerPart = content.substring(0, headerEnd);
-                String[] lines = headerPart.split("\n");
-                for (String line : lines) {
-                    int colon = line.indexOf(':');
-                    if (colon != -1) {
-                        response.addHeader(line.substring(0, colon).trim(), line.substring(colon + 1).trim());
-                    }
-                }
-                
-                int bodyStart = headerEnd + (content.startsWith("\r\n\r\n", headerEnd) ? 4 : 2);
-                byte[] body = new byte[output.length - bodyStart];
-                System.arraycopy(output, bodyStart, body, 0, body.length);
-                response.setBody(body);
-            } else {
-                response.setBody(output);
-            }
-            
-            context.setResponse(response.getBytes());
-            key.interestOps(SelectionKey.OP_WRITE);
-            Files.deleteIfExists(context.getCgiOutputPath());
-        } catch (IOException e) {
-            HttpResponse response = new HttpResponse();
-            response.setStatus(500);
-            response.setBody("CGI Error");
-            context.setResponse(response.getBytes());
-            key.interestOps(SelectionKey.OP_WRITE);
-        }
-    }
-
-    private void handleAccept(SelectionKey key) throws IOException {
-        ServerSocketChannel serverChannel = (ServerSocketChannel) key.channel();
-        SocketChannel clientChannel = serverChannel.accept();
-        clientChannel.configureBlocking(false);
-        
-        ConnectionContext context = new ConnectionContext(clientChannel);
-        context.getParser().setBodyLimit(config.server.maxBodySize);
-        context.getParser().setHeaderLimit(config.server.maxHeaderSize);
-        clientChannel.register(selector, SelectionKey.OP_READ, context);
-    }
-
-    private void handleRead(SelectionKey key) throws IOException {
-        ConnectionContext context = (ConnectionContext) key.attachment();
-        context.updateActivity();
-        SocketChannel channel = context.getChannel();
-        
-        context.getReadBuffer().clear();
-        int read = channel.read(context.getReadBuffer());
-        
+        int read = channel.read(client.buffer);
         if (read == -1) {
-            context.close();
-            key.cancel();
+            close(key);
             return;
         }
 
-        context.getReadBuffer().flip();
-        HttpParser.State state = context.getParser().parse(context.getReadBuffer());
+        client.buffer.flip();
+        while (client.buffer.hasRemaining()) {
+            client.requestBytes.write(client.buffer.get());
+        }
+        client.buffer.clear();
 
-        if (state == HttpParser.State.DONE) {
-            HandlerResult result = router.handle(context.getParser().getRequest());
-            if (result.cgiResult != null) {
-                context.setCgiProcess(result.cgiResult.process, result.cgiResult.outputPath);
-                key.interestOps(0); // Stop listening for events until process finished
-            } else {
-                context.setResponse(result.response.getBytes());
-                key.interestOps(SelectionKey.OP_WRITE);
-            }
-        } else if (state == HttpParser.State.ERROR) {
-            HttpResponse response = new HttpResponse();
-            // Check if it was a 413
-            if (context.getParser().getRequest().getHeaders().get("content-length") != null) {
-                // This is a bit simplified, but if it's an error and has content-length, assume it might be 413
-                response.setStatus(413);
-            } else {
-                response.setStatus(400);
-            }
-            context.setResponse(response.getBytes());
+        try {
+            HttpRequest request = parseRequest(client.requestBytes.toByteArray());
+            if (request == null) return;
+
+            HttpResponse response = router.handle(request);
+            client.response = ByteBuffer.wrap(response.getBytes());
+            key.interestOps(SelectionKey.OP_WRITE);
+        } catch (HttpError e) {
+            client.response = ByteBuffer.wrap(router.errorResponse(e.status).getBytes());
             key.interestOps(SelectionKey.OP_WRITE);
         }
     }
 
-    private void handleWrite(SelectionKey key) throws IOException {
-        ConnectionContext context = (ConnectionContext) key.attachment();
-        context.updateActivity();
-        SocketChannel channel = context.getChannel();
-        
-        ByteBuffer writeBuffer = context.getWriteBuffer();
-        if (writeBuffer != null && writeBuffer.hasRemaining()) {
-            int written = channel.write(writeBuffer);
-            context.addBytesWritten(written);
+    private void write(SelectionKey key) throws IOException {
+        SocketChannel channel = (SocketChannel) key.channel();
+        Client client = (Client) key.attachment();
+        client.lastActivity = System.currentTimeMillis();
+
+        channel.write(client.response);
+        if (!client.response.hasRemaining()) {
+            close(key);
         }
-        
-        if (writeBuffer == null || !writeBuffer.hasRemaining()) {
-            if (context.hasMoreToWrite()) {
-                context.prepareNextWriteChunk();
-                // Stay in OP_WRITE to handle backpressure and write next chunk
-            } else {
-                String connection = context.getParser().getRequest().getHeaders().get("connection");
-                if (connection != null && connection.equalsIgnoreCase("close")) {
-                    context.close();
-                    key.cancel();
-                } else {
-                    // Reuse connection
-                    context.releaseBuffers(); // frees old buffers without closing channel
-                    ConnectionContext newContext = new ConnectionContext(channel);
-                    newContext.getParser().setBodyLimit(config.server.maxBodySize);
-                    newContext.getParser().setHeaderLimit(config.server.maxHeaderSize);
-                    key.attach(newContext);
-                    key.interestOps(SelectionKey.OP_READ);
+    }
+
+    private HttpRequest parseRequest(byte[] data) throws HttpError {
+        int headerEnd = headerEnd(data);
+        if (headerEnd == -1) {
+            if (data.length > config.server.maxHeaderSize) throw new HttpError(400);
+            return null;
+        }
+
+        String headersText = new String(data, 0, headerEnd);
+        String[] lines = headersText.split("\\r?\\n");
+        if (lines.length == 0) throw new HttpError(400);
+
+        String[] first = lines[0].split("\\s+");
+        if (first.length != 3) throw new HttpError(400);
+
+        HttpRequest request = new HttpRequest();
+        try {
+            request.setMethod(first[0]);
+            request.setPath(first[1]);
+            request.setVersion(first[2]);
+        } catch (IllegalArgumentException e) {
+            throw new HttpError(400);
+        }
+
+        for (int i = 1; i < lines.length; i++) {
+            int colon = lines[i].indexOf(':');
+            if (colon > 0) {
+                request.addHeader(lines[i].substring(0, colon), lines[i].substring(colon + 1));
+            }
+        }
+
+        int bodyStart = headerEnd + separatorSize(data, headerEnd);
+        byte[] body = body(data, bodyStart, request);
+        if (body == null) return null;
+        request.setBody(body);
+        return request;
+    }
+
+    private byte[] body(byte[] data, int bodyStart, HttpRequest request) throws HttpError {
+        String transferEncoding = request.getHeaders().get("transfer-encoding");
+        if (transferEncoding != null && transferEncoding.toLowerCase().contains("chunked")) {
+            return chunkedBody(data, bodyStart);
+        }
+
+        int length = 0;
+        String contentLength = request.getHeaders().get("content-length");
+        if (contentLength != null) {
+            try {
+                length = Integer.parseInt(contentLength);
+            } catch (NumberFormatException e) {
+                throw new HttpError(400);
+            }
+        }
+
+        if (length > config.server.maxBodySize) throw new HttpError(413);
+        if (data.length - bodyStart < length) return null;
+
+        byte[] body = new byte[length];
+        System.arraycopy(data, bodyStart, body, 0, length);
+        return body;
+    }
+
+    private byte[] chunkedBody(byte[] data, int start) throws HttpError {
+        ByteArrayOutputStream body = new ByteArrayOutputStream();
+        int pos = start;
+
+        while (true) {
+            int lineEnd = findLineEnd(data, pos);
+            if (lineEnd == -1) return null;
+
+            String line = new String(data, pos, lineEnd - pos).trim();
+            int size;
+            try {
+                size = Integer.parseInt(line.split(";", 2)[0], 16);
+            } catch (NumberFormatException e) {
+                throw new HttpError(400);
+            }
+
+            pos = lineEnd + lineSeparatorSize(data, lineEnd);
+            if (size == 0) return body.toByteArray();
+            if (body.size() + size > config.server.maxBodySize) throw new HttpError(413);
+            if (data.length < pos + size + 2) return null;
+
+            body.write(data, pos, size);
+            pos += size;
+            if (pos < data.length && data[pos] == '\r') pos++;
+            if (pos < data.length && data[pos] == '\n') pos++;
+        }
+    }
+
+    private int headerEnd(byte[] data) {
+        for (int i = 0; i < data.length - 3; i++) {
+            if (data[i] == '\r' && data[i + 1] == '\n' && data[i + 2] == '\r' && data[i + 3] == '\n') return i;
+        }
+        for (int i = 0; i < data.length - 1; i++) {
+            if (data[i] == '\n' && data[i + 1] == '\n') return i;
+        }
+        return -1;
+    }
+
+    private int separatorSize(byte[] data, int pos) {
+        return data[pos] == '\r' ? 4 : 2;
+    }
+
+    private int findLineEnd(byte[] data, int start) {
+        for (int i = start; i < data.length; i++) {
+            if (data[i] == '\n') return data[i - 1] == '\r' ? i - 1 : i;
+        }
+        return -1;
+    }
+
+    private int lineSeparatorSize(byte[] data, int lineEnd) {
+        return lineEnd + 1 < data.length && data[lineEnd] == '\r' && data[lineEnd + 1] == '\n' ? 2 : 1;
+    }
+
+    private void closeTimedOutClients() {
+        long now = System.currentTimeMillis();
+        for (SelectionKey key : selector.keys()) {
+            if (key.attachment() instanceof Client) {
+                Client client = (Client) key.attachment();
+                if (now - client.lastActivity > config.server.keepAliveTimeoutMs) {
+                    close(key);
                 }
             }
+        }
+    }
+
+    private void close(SelectionKey key) {
+        try {
+            key.channel().close();
+        } catch (IOException ignored) {
+        }
+        key.cancel();
+    }
+
+    private static class Client {
+        private final ByteBuffer buffer = ByteBuffer.allocate(8192);
+        private final ByteArrayOutputStream requestBytes = new ByteArrayOutputStream();
+        private ByteBuffer response;
+        private long lastActivity = System.currentTimeMillis();
+    }
+
+    private static class HttpError extends Exception {
+        private final int status;
+
+        private HttpError(int status) {
+            this.status = status;
         }
     }
 }

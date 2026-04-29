@@ -23,7 +23,7 @@
         {
           "path": "/cgi-bin",
           "handler": "CgiHandler",
-          "cgiExtension": ".js"
+          "cgiExtension": ".py"
         },
         {
           "path": "/",

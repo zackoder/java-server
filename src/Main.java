@@ -5,7 +5,7 @@ import java.io.IOException;
 public class Main {
     public static void main(String[] args) {
         String configPath = "config.json";
-        if (args.length > 0) {
+        if (args.length > 0 && !args[0].trim().isEmpty()) {
             configPath = args[0];
         }
 

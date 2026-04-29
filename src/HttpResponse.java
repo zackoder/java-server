@@ -2,7 +2,6 @@ package src;
 
 import java.util.HashMap;
 import java.util.Map;
-import java.nio.ByteBuffer;
 
 public class HttpResponse {
     private int status = 200;
@@ -26,7 +25,7 @@ public class HttpResponse {
 
     public HttpResponse() {
         headers.put("Server", "JavaCustomServer/1.0");
-        headers.put("Connection", "keep-alive");
+        headers.put("Connection", "close");
     }
 
     public void setStatus(int code) {

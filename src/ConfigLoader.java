@@ -11,12 +11,17 @@ public class ConfigLoader {
         public String path;
         public String handler;
         public String cgiExtension;
+        public String redirectTo;
+        public List<String> methods = new ArrayList<>();
+        public List<String> indexFiles = new ArrayList<>();
     }
 
     public static class VHostConfig {
         public String domain;
         public String root;
         public boolean allowDirectoryListing;
+        public Map<Integer, String> errorPages = new HashMap<>();
+        public List<String> indexFiles = new ArrayList<>();
         public List<RouteConfig> routes = new ArrayList<>();
     }
 
@@ -27,6 +32,7 @@ public class ConfigLoader {
         public int bufferSize = 8192;
         public int maxHeaderSize = 8192;
         public long maxBodySize = 1048576;
+        public Map<Integer, String> errorPages = new HashMap<>();
     }
 
     public static class AppConfig {
@@ -70,6 +76,7 @@ public class ConfigLoader {
                 config.server.maxHeaderSize = ((Number) sMap.get("maxHeaderSize")).intValue();
             if (sMap.containsKey("maxBodySize"))
                 config.server.maxBodySize = ((Number) sMap.get("maxBodySize")).longValue();
+            readErrorPages(sMap.get("errorPages"), config.server.errorPages);
         }
 
         if (map.containsKey("vhosts")) {
@@ -83,6 +90,8 @@ public class ConfigLoader {
                     vhost.root = (String) vMap.get("root");
                 if (vMap.containsKey("allowDirectoryListing"))
                     vhost.allowDirectoryListing = (Boolean) vMap.get("allowDirectoryListing");
+                readStringList(vMap.get("indexFiles"), vhost.indexFiles, false);
+                readErrorPages(vMap.get("errorPages"), vhost.errorPages);
 
                 if (vMap.containsKey("routes")) {
                     List<Object> rList = (List<Object>) vMap.get("routes");
@@ -95,6 +104,10 @@ public class ConfigLoader {
                             rc.handler = (String) rMap.get("handler");
                         if (rMap.containsKey("cgiExtension"))
                             rc.cgiExtension = (String) rMap.get("cgiExtension");
+                        if (rMap.containsKey("redirectTo"))
+                            rc.redirectTo = (String) rMap.get("redirectTo");
+                        readStringList(rMap.get("methods"), rc.methods, true);
+                        readStringList(rMap.get("indexFiles"), rc.indexFiles, false);
                         vhost.routes.add(rc);
                     }
                 }
@@ -102,6 +115,28 @@ public class ConfigLoader {
             }
         }
         return config;
+    }
+
+    private static void readStringList(Object value, List<String> output, boolean uppercase) {
+        if (!(value instanceof List)) return;
+        for (Object item : (List<?>) value) {
+            if (item != null) {
+                String text = item.toString();
+                output.add(uppercase ? text.toUpperCase() : text);
+            }
+        }
+    }
+
+    private static void readErrorPages(Object value, Map<Integer, String> output) {
+        if (!(value instanceof Map)) return;
+        Map<?, ?> pages = (Map<?, ?>) value;
+        for (Map.Entry<?, ?> entry : pages.entrySet()) {
+            try {
+                output.put(Integer.parseInt(entry.getKey().toString()), entry.getValue().toString());
+            } catch (NumberFormatException ignored) {
+                System.err.println("Ignoring invalid error page status: " + entry.getKey());
+            }
+        }
     }
 
     // Mini JSON Parser
@@ -145,7 +180,7 @@ public class ConfigLoader {
             Map<String, Object> map = new HashMap<>();
             pos++; // skip '{'
             skipWhitespace();
-            if (json.charAt(pos) == '}') {
+            if (pos < json.length() && json.charAt(pos) == '}') {
                 pos++;
                 return map;
             }
@@ -159,11 +194,11 @@ public class ConfigLoader {
                 Object value = parseValue();
                 map.put(key, value);
                 skipWhitespace();
-                if (json.charAt(pos) == '}') {
+                if (pos < json.length() && json.charAt(pos) == '}') {
                     pos++;
                     break;
                 }
-                if (json.charAt(pos) != ',')
+                if (pos >= json.length() || json.charAt(pos) != ',')
                     throw new RuntimeException("Expected ',' or '}' at " + pos);
                 pos++; // skip ','
             }
@@ -174,7 +209,7 @@ public class ConfigLoader {
             List<Object> list = new ArrayList<>();
             pos++; // skip '['
             skipWhitespace();
-            if (json.charAt(pos) == ']') {
+            if (pos < json.length() && json.charAt(pos) == ']') {
                 pos++;
                 return list;
             }
@@ -182,11 +217,11 @@ public class ConfigLoader {
                 Object value = parseValue();
                 list.add(value);
                 skipWhitespace();
-                if (json.charAt(pos) == ']') {
+                if (pos < json.length() && json.charAt(pos) == ']') {
                     pos++;
                     break;
                 }
-                if (json.charAt(pos) != ',')
+                if (pos >= json.length() || json.charAt(pos) != ',')
                     throw new RuntimeException("Expected ',' or ']' at " + pos);
                 pos++; // skip ','
             }
@@ -194,15 +229,17 @@ public class ConfigLoader {
         }
 
         private String parseString() {
-            if (json.charAt(pos) != '"')
+            if (pos >= json.length() || json.charAt(pos) != '"')
                 throw new RuntimeException("invalid json format '\"' at " + pos);
             pos++; // skip '"'
             int start = pos;
-            while (json.charAt(pos) != '"') {
+            while (pos < json.length() && json.charAt(pos) != '"') {
                 if (json.charAt(pos) == '\\')
                     pos++; // skip escaped char
                 pos++;
             }
+            if (pos >= json.length())
+                throw new RuntimeException("Unterminated string at " + start);
             String str = json.substring(start, pos);
             pos++; // skip '"'
             return str;
@@ -234,6 +271,8 @@ public class ConfigLoader {
                 pos++;
             }
             String numStr = json.substring(start, pos);
+            if (numStr.isEmpty())
+                throw new RuntimeException("Expected value at " + pos);
             if (numStr.contains(".")) {
                 return Double.parseDouble(numStr);
             } else {
